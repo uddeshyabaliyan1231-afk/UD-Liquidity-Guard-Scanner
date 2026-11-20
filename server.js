@@ -86,7 +86,7 @@ async function getJSON(url, attempts = CONFIG.retries) {
       });
 
       if (!response.ok) {
-        throw new Error(`CoinDCX API status ${response.status}`);
+        throw new Error("CoinDCX API status " + response.status);
       }
 
       return await response.json();
@@ -206,7 +206,6 @@ function analyseCandles(candles) {
     (a, b) => num(a.time) - num(b.time)
   );
 
-  // Incomplete candle ko ignore karo.
   const closed = sorted.slice(0, -1);
 
   if (closed.length < 200) return null;
@@ -317,7 +316,8 @@ function parseSide(side) {
 
 async function checkOrderbook(pair) {
   const url =
-    `${API.orderbook}/${encodeURIComponent(pair)}-futures/50`;
+    API.orderbook + "/" +
+    encodeURIComponent(pair) + "-futures/50";
 
   const data = await getJSON(url);
 
@@ -445,7 +445,6 @@ async function scanCoin(item) {
 
   let direction;
 
-  // Higher timeframe hard filter.
   if (
     h4.trend === "BULLISH" &&
     h1.trend === "BULLISH"
@@ -467,7 +466,6 @@ async function scanCoin(item) {
     return reject("30M_TREND_CONFLICT");
   }
 
-  // 15M and 5M confirmation score.
   let score = 0;
 
   if (m15.trend === expected) score += 2;
@@ -486,7 +484,6 @@ async function scanCoin(item) {
     if (m5.lowerWickRatio <= 0.45) score += 1;
   }
 
-  // Minimum score required for an actionable signal.
   if (score < 7) {
     return reject("CONFIRMATION_SCORE_LOW");
   }
@@ -657,7 +654,7 @@ async function runScan() {
     scanStatus.eligiblePairs = withTicker.length;
 
     scanStatus.message =
-      `Deep scanning ${withTicker.length} active pairs`;
+      "Deep scanning " + withTicker.length + " active pairs";
 
     const results = await mapAll(withTicker);
 
@@ -673,28 +670,289 @@ async function runScan() {
     scanStatus.message = "Full market scan completed";
 
   } catch (error) {
-    scanStatus.message = `Scan error: ${error.message}`;
+    scanStatus.message = "Scan error: " + error.message;
 
   } finally {
     scanStatus.running = false;
   }
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    name: "UD Liquidity Guard Scanner",
-    status: "Online",
-    coinLimit: "NONE",
-    endpoints: [
-      "/api/status",
-      "/api/signals",
-      "/api/rejections",
-      "/api/scan",
-      "/api/search?pair=BTCUSDT",
-      "/api/health"
-    ]
-  });
+/* ================= DASHBOARD ================= */
+
+const dashboard = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#080d18">
+<title>UD Liquidity Guard Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#080d18;color:#e8edf7;font-family:Arial,sans-serif}
+header{padding:20px 16px;background:#101a2b;border-bottom:1px solid #26344c}
+h1{font-size:22px;margin:0 0 7px}
+.sub{color:#93a4bd;font-size:12px}
+main{max-width:1100px;margin:auto;padding:16px}
+.status{display:flex;align-items:center;gap:8px;margin:8px 0 18px;color:#aab9ce;font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:#f0b44d}
+.dot.live{background:#24d18a}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.card{background:#111c2e;border:1px solid #253650;border-radius:12px;padding:15px}
+.card small{color:#91a3bd;font-size:12px}
+.card strong{display:block;font-size:23px;margin-top:9px}
+.green{color:#20d997}.red{color:#ff6577}
+.panel{background:#111c2e;border:1px solid #253650;border-radius:12px;padding:15px;margin-top:16px}
+.panel h2{font-size:16px;margin:0 0 14px}
+.progress{height:9px;background:#26354c;border-radius:10px;overflow:hidden}
+.bar{height:100%;width:0;background:#27c994;transition:width .3s}
+.row{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+button{border:0;border-radius:8px;padding:11px 15px;font-weight:bold;background:#20c997;color:#07131a;cursor:pointer}
+button.secondary{background:#263650;color:#e8edf7}
+button:disabled{opacity:.5}
+input{background:#091321;color:white;border:1px solid #344761;padding:11px;border-radius:8px;min-width:0}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+.controls input{flex:1}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:680px;font-size:12px}
+th,td{text-align:left;padding:12px 9px;border-bottom:1px solid #263650;white-space:nowrap}
+th{color:#91a3bd}
+.pill{padding:5px 8px;border-radius:6px;font-weight:bold}
+.buy{background:#123e34;color:#42e4ad}
+.sell{background:#451d2a;color:#ff8090}
+.muted{color:#91a3bd}
+#message{font-size:13px;color:#aab9ce;margin:12px 0}
+#rejections{display:flex;gap:7px;flex-wrap:wrap}
+.tag{background:#202e43;padding:7px 9px;border-radius:7px;font-size:11px;color:#c0cde0}
+footer{text-align:center;color:#687d99;font-size:11px;padding:25px}
+@media(max-width:600px){
+ .cards{grid-template-columns:repeat(2,1fr)}
+ h1{font-size:19px}
+ main{padding:11px}
+ .card{padding:12px}
+ .card strong{font-size:20px}
+}
+</style>
+</head>
+<body>
+<header>
+ <h1>UD Liquidity Guard Scanner</h1>
+ <div class="sub">CoinDCX Futures · Multi-Timeframe Analysis · 5M Entry</div>
+</header>
+<main>
+ <div class="status"><span class="dot" id="dot"></span><span id="state">Connecting to scanner...</span></div>
+
+ <section class="cards">
+  <div class="card"><small>Total pairs</small><strong id="total">--</strong></div>
+  <div class="card"><small>Checked pairs</small><strong id="checked">--</strong></div>
+  <div class="card"><small>BUY / SELL signals</small><strong id="signals">--</strong></div>
+  <div class="card"><small>Skipped pairs</small><strong id="skipped">--</strong></div>
+ </section>
+
+ <section class="panel">
+  <div class="row">
+   <h2>Market scan progress</h2>
+   <span class="muted" id="percent">0%</span>
+  </div>
+  <div class="progress"><div class="bar" id="bar"></div></div>
+  <div id="message">Waiting for scanner...</div>
+  <div class="row">
+   <span class="muted" id="lastscan">Last scan: --</span>
+   <button id="scanBtn" onclick="startScan()">START NEW SCAN</button>
+  </div>
+ </section>
+
+ <section class="panel">
+  <h2>Manual coin search</h2>
+  <div class="controls">
+   <input id="pair" placeholder="Enter pair e.g. BTCUSDT">
+   <button onclick="searchPair()">SEARCH</button>
+  </div>
+  <div id="searchResult" class="muted" style="margin-top:12px"></div>
+ </section>
+
+ <section class="panel">
+  <div class="row">
+   <h2>Trade-ready signals</h2>
+   <span class="muted">Only BUY / SELL</span>
+  </div>
+  <div class="tablewrap">
+   <table>
+    <thead>
+     <tr>
+      <th>Coin</th><th>Signal</th><th>Entry</th>
+      <th>Stop Loss</th><th>Target 1</th><th>Target 2</th>
+      <th>Score</th><th>Liquidity</th>
+     </tr>
+    </thead>
+    <tbody id="signalRows">
+     <tr><td colspan="8" class="muted">No signals available yet</td></tr>
+    </tbody>
+   </table>
+  </div>
+ </section>
+
+ <section class="panel">
+  <h2>Rejected pair reasons</h2>
+  <div id="rejections" class="muted">Waiting for scan data...</div>
+ </section>
+</main>
+<footer>UD Liquidity Guard Scanner · Data from CoinDCX public market APIs</footer>
+
+<script>
+const el = id => document.getElementById(id);
+
+function money(value){
+ if(value===null || value===undefined || !Number.isFinite(Number(value))) return "--";
+ return Number(value).toPrecision(8).replace(/0+$/,"").replace(/\\.$/,"");
+}
+
+function time(value){
+ if(!value) return "--";
+ const d=new Date(value);
+ return isNaN(d.getTime()) ? "--" : d.toLocaleString();
+}
+
+async function getAPI(path){
+ const response=await fetch(path,{cache:"no-store"});
+ if(!response.ok) throw new Error("API error "+response.status);
+ return response.json();
+}
+
+async function refresh(){
+ try{
+  const [status,signalData,rejectionData]=await Promise.all([
+   getAPI("/api/status"),
+   getAPI("/api/signals"),
+   getAPI("/api/rejections")
+  ]);
+
+  el("total").textContent=status.totalPairs ?? 0;
+  el("checked").textContent=(status.checked ?? 0)+" / "+(status.eligiblePairs ?? 0);
+  el("signals").textContent=signalData.count ?? 0;
+  el("skipped").textContent=status.skipped ?? 0;
+
+  const total=Number(status.eligiblePairs || 0);
+  const checked=Number(status.checked || 0);
+  const percent=total ? Math.min(100,checked/total*100) : 0;
+
+  el("bar").style.width=percent+"%";
+  el("percent").textContent=percent.toFixed(1)+"%";
+  el("message").textContent=status.message || "Waiting...";
+  el("lastscan").textContent="Last completed scan: "+time(status.lastScan);
+
+  el("dot").className=status.running ? "dot live" : "dot";
+  el("state").textContent=status.running ? "SCANNER RUNNING" : "SCANNER IDLE";
+  el("scanBtn").disabled=!!status.running;
+  el("scanBtn").textContent=status.running ? "SCANNING..." : "START NEW SCAN";
+
+  renderSignals(signalData.signals || []);
+  renderRejections(rejectionData.rejected || {});
+
+ }catch(error){
+  el("state").textContent="Connection error: "+error.message;
+  el("dot").className="dot";
+ }
+}
+
+function renderSignals(signals){
+ const body=el("signalRows");
+
+ if(!signals.length){
+  body.innerHTML='<tr><td colspan="8" class="muted">No trade-ready BUY / SELL signals currently available.</td></tr>';
+  return;
+ }
+
+ body.innerHTML=signals.map(s=>{
+  const cls=s.signal==="BUY" ? "buy" : "sell";
+  return '<tr>'+
+   '<td><b>'+safe(s.symbol || s.pair)+'</b></td>'+
+   '<td><span class="pill '+cls+'">'+safe(s.signal)+'</span></td>'+
+   '<td>'+money(s.entry)+'</td>'+
+   '<td>'+money(s.stopLoss)+'</td>'+
+   '<td>'+money(s.target1)+'</td>'+
+   '<td>'+money(s.target2)+'</td>'+
+   '<td>'+safe(s.confirmationScore)+'/9</td>'+
+   '<td><span class="pill buy">PASSED</span></td>'+
+  '</tr>';
+ }).join("");
+}
+
+function renderRejections(data){
+ const box=el("rejections");
+ const entries=Object.entries(data).sort((a,b)=>b[1]-a[1]);
+
+ if(!entries.length){
+  box.textContent="No rejection data yet.";
+  return;
+ }
+
+ box.innerHTML=entries.map(([name,count])=>
+  '<span class="tag">'+safe(name)+': '+Number(count)+'</span>'
+ ).join("");
+}
+
+function safe(value){
+ return String(value ?? "").replace(/[&<>"']/g,c=>({
+  "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+ }[c]));
+}
+
+async function startScan(){
+ el("scanBtn").disabled=true;
+ try{
+  await getAPI("/api/scan");
+  await refresh();
+ }catch(error){
+  el("message").textContent=error.message;
+ }
+}
+
+async function searchPair(){
+ const pair=el("pair").value.trim().toUpperCase();
+ if(!pair){
+  el("searchResult").textContent="Enter a CoinDCX pair first.";
+  return;
+ }
+
+ el("searchResult").textContent="Searching "+pair+"...";
+ try{
+  const data=await getAPI("/api/search?pair="+encodeURIComponent(pair));
+
+  if(data.signal==="NO TRADE"){
+   el("searchResult").textContent=pair+": NO TRADE — "+data.message;
+   return;
+  }
+
+  el("searchResult").innerHTML=
+   '<b>'+safe(data.pair)+'</b> · <span class="pill '+(data.signal==="BUY"?"buy":"sell")+'">'+safe(data.signal)+'</span><br>'+
+   'Entry: '+money(data.entry)+'<br>'+
+   'Stop Loss: '+money(data.stopLoss)+'<br>'+
+   'Target 1: '+money(data.target1)+'<br>'+
+   'Target 2: '+money(data.target2)+'<br>'+
+   'Confirmation: '+safe(data.confirmationScore)+'/9<br>'+
+   'Liquidity: PASSED';
+
+ }catch(error){
+  el("searchResult").textContent="Search failed: "+error.message;
+ }
+}
+
+el("pair").addEventListener("keydown",e=>{
+ if(e.key==="Enter") searchPair();
 });
+
+refresh();
+setInterval(refresh,3000);
+</script>
+</body>
+</html>`;
+
+/* Dashboard is now the home page */
+app.get("/", (req, res) => {
+  res.type("html").send(dashboard);
+});
+
+/* ================= API ROUTES ================= */
 
 app.get("/api/status", (req, res) => {
   res.json(scanStatus);
@@ -730,7 +988,7 @@ app.get("/api/scan", (req, res) => {
 });
 
 app.get("/api/search", async (req, res) => {
-  const pair = String(req.query.pair || "").trim();
+  const pair = String(req.query.pair || "").trim().toUpperCase();
 
   if (!pair) {
     return res.status(400).json({
@@ -791,7 +1049,7 @@ app.get("/api/health", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(
-    `UD Liquidity Guard running on port ${PORT}`
+    "UD Liquidity Guard running on port " + PORT
   );
 
   runScan();
