@@ -1,3 +1,4 @@
+
 const express = require("express");
 
 const app = express();
@@ -6,15 +7,19 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const API = {
-  instruments: "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT",
-  prices: "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
-  candles: "https://public.coindcx.com/market_data/candlesticks",
-  orderbook: "https://public.coindcx.com/market_data/v3/orderbook"
+  instruments:
+    "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT",
+  prices:
+    "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
+  candles:
+    "https://public.coindcx.com/market_data/candlesticks",
+  orderbook:
+    "https://public.coindcx.com/market_data/v3/orderbook"
 };
 
 const CONFIG = {
-  concurrency: 3,
-  requestSpacingMs: 350,
+  concurrency: 2,
+  requestSpacingMs: 300,
   minQuoteVolume: 100000,
   minBookDepth: 1500,
   maxSpreadPercent: 0.12,
@@ -39,7 +44,8 @@ let scanStatus = {
   message: "Waiting for scan"
 };
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
 
 let requestTail = Promise.resolve();
 let lastRequestAt = 0;
@@ -74,7 +80,7 @@ async function getJSON(url, attempts = CONFIG.retries) {
 
       const response = await fetch(url, {
         headers: {
-          "User-Agent": "UD-Liquidity-Guard-Scanner/2.0"
+          "User-Agent": "UD-Liquidity-Guard-Scanner/3.0"
         },
         signal: AbortSignal.timeout(CONFIG.requestTimeoutMs)
       });
@@ -136,6 +142,25 @@ function getPriceMap(data) {
   return {};
 }
 
+function getTickerPrice(ticker) {
+  return num(
+    ticker?.ls ??
+    ticker?.last_price ??
+    ticker?.lastPrice ??
+    ticker?.price ??
+    ticker?.p
+  );
+}
+
+function getTickerVolume(ticker) {
+  return num(
+    ticker?.v ??
+    ticker?.volume ??
+    ticker?.volume_24h ??
+    ticker?.volume24h
+  );
+}
+
 function ema(values, period) {
   if (values.length < period) return null;
 
@@ -169,7 +194,6 @@ function rsi(values, period = 14) {
   if (losses === 0) return 100;
 
   const rs = gains / Math.max(losses, 1e-10);
-
   return 100 - 100 / (1 + rs);
 }
 
@@ -182,7 +206,7 @@ function analyseCandles(candles) {
     (a, b) => num(a.time) - num(b.time)
   );
 
-  // Current forming candle ko ignore karo.
+  // Incomplete candle ko ignore karo.
   const closed = sorted.slice(0, -1);
 
   if (closed.length < 200) return null;
@@ -236,10 +260,8 @@ function analyseCandles(candles) {
     trend,
     rsi: rsi(closes),
     volumeRising: recentVol > previousVol,
-
     upperWickRatio:
       (high - Math.max(open, price)) / range,
-
     lowerWickRatio:
       (Math.min(open, price) - low) / range
   };
@@ -268,7 +290,6 @@ async function getCandles(pair, resolution) {
   const data = await getJSON(url.toString());
 
   if (Array.isArray(data)) return data;
-
   return Array.isArray(data?.data) ? data.data : [];
 }
 
@@ -309,10 +330,7 @@ async function checkOrderbook(pair) {
   );
 
   if (!bids.length || !asks.length) {
-    return {
-      safe: false,
-      reason: "EMPTY_ORDERBOOK"
-    };
+    return { safe: false, reason: "EMPTY_ORDERBOOK" };
   }
 
   const bestBid = bids[0].price;
@@ -320,22 +338,17 @@ async function checkOrderbook(pair) {
   const mid = (bestBid + bestAsk) / 2;
 
   if (bestAsk <= bestBid || mid <= 0) {
-    return {
-      safe: false,
-      reason: "INVALID_BOOK"
-    };
+    return { safe: false, reason: "INVALID_BOOK" };
   }
 
   const spread = (bestAsk - bestBid) / mid * 100;
 
   const bidDepth = bids.reduce(
-    (sum, x) => sum + x.price * x.qty,
-    0
+    (sum, x) => sum + x.price * x.qty, 0
   );
 
   const askDepth = asks.reduce(
-    (sum, x) => sum + x.price * x.qty,
-    0
+    (sum, x) => sum + x.price * x.qty, 0
   );
 
   const totalDepth = bidDepth + askDepth;
@@ -381,25 +394,6 @@ function reject(reason) {
     (rejectedCounts[reason] || 0) + 1;
 
   return null;
-}
-
-function getTickerPrice(ticker) {
-  return num(
-    ticker?.ls ??
-    ticker?.last_price ??
-    ticker?.lastPrice ??
-    ticker?.price ??
-    ticker?.p
-  );
-}
-
-function getTickerVolume(ticker) {
-  return num(
-    ticker?.v ??
-    ticker?.volume ??
-    ticker?.volume_24h ??
-    ticker?.volume24h
-  );
 }
 
 async function scanCoin(item) {
@@ -451,16 +445,17 @@ async function scanCoin(item) {
 
   let direction;
 
+  // Higher timeframe hard filter.
   if (
-    [h4, h1, m30].every(x => x.trend === "BULLISH")
+    h4.trend === "BULLISH" &&
+    h1.trend === "BULLISH"
   ) {
     direction = "BUY";
-
   } else if (
-    [h4, h1, m30].every(x => x.trend === "BEARISH")
+    h4.trend === "BEARISH" &&
+    h1.trend === "BEARISH"
   ) {
     direction = "SELL";
-
   } else {
     return reject("HIGHER_TF_CONFLICT");
   }
@@ -468,15 +463,32 @@ async function scanCoin(item) {
   const expected =
     direction === "BUY" ? "BULLISH" : "BEARISH";
 
-  if (
-    m15.trend !== expected ||
-    m5.trend !== expected
-  ) {
-    return reject("LOWER_TF_CONFLICT");
+  if (m30.trend !== expected) {
+    return reject("30M_TREND_CONFLICT");
   }
 
-  if (!m15.volumeRising || !m5.volumeRising) {
-    return reject("VOLUME_NOT_RISING");
+  // 15M and 5M confirmation score.
+  let score = 0;
+
+  if (m15.trend === expected) score += 2;
+  if (m5.trend === expected) score += 2;
+
+  if (m15.volumeRising) score += 1;
+  if (m5.volumeRising) score += 1;
+
+  if (direction === "BUY") {
+    if (m5.rsi >= 48 && m5.rsi <= 72) score += 1;
+    if (m5.price > m5.open) score += 1;
+    if (m5.upperWickRatio <= 0.45) score += 1;
+  } else {
+    if (m5.rsi >= 28 && m5.rsi <= 52) score += 1;
+    if (m5.price < m5.open) score += 1;
+    if (m5.lowerWickRatio <= 0.45) score += 1;
+  }
+
+  // Minimum score required for an actionable signal.
+  if (score < 7) {
+    return reject("CONFIRMATION_SCORE_LOW");
   }
 
   let book;
@@ -496,37 +508,12 @@ async function scanCoin(item) {
   }
 
   if (direction === "BUY") {
-    if (m5.rsi < 50 || m5.rsi > 72) {
-      return reject("BUY_RSI_FILTER");
-    }
-
-    if (m5.upperWickRatio > 0.45) {
-      return reject("BUY_REJECTION_WICK");
-    }
-
     if (book.imbalance < CONFIG.minImbalance) {
       return reject("BUY_ORDERBOOK_IMBALANCE");
     }
-
-    if (m5.price <= m5.open) {
-      return reject("BUY_CANDLE_CONFIRMATION");
-    }
-
   } else {
-    if (m5.rsi < 28 || m5.rsi > 50) {
-      return reject("SELL_RSI_FILTER");
-    }
-
-    if (m5.lowerWickRatio > 0.45) {
-      return reject("SELL_REJECTION_WICK");
-    }
-
     if (book.imbalance > 1 / CONFIG.minImbalance) {
       return reject("SELL_ORDERBOOK_IMBALANCE");
-    }
-
-    if (m5.price >= m5.open) {
-      return reject("SELL_CANDLE_CONFIRMATION");
     }
   }
 
@@ -541,6 +528,7 @@ async function scanCoin(item) {
     symbol: pair,
     pair,
     signal: direction,
+    confirmationScore: score,
     entry,
 
     stopLoss: direction === "BUY"
@@ -563,7 +551,8 @@ async function scanCoin(item) {
       bidDepth: Number(book.bidDepth.toFixed(2)),
       askDepth: Number(book.askDepth.toFixed(2)),
       imbalance: Number(book.imbalance.toFixed(3)),
-      wallConcentration: Number(book.wallConcentration.toFixed(3))
+      wallConcentration:
+        Number(book.wallConcentration.toFixed(3))
     },
 
     trend: {
@@ -606,7 +595,6 @@ async function mapAll(items) {
   );
 
   await Promise.all(workers);
-
   return results;
 }
 
@@ -622,7 +610,7 @@ async function runScan() {
   rejectedCounts = {};
 
   scanStatus.message =
-    "Loading active CoinDCX USDT futures pairs";
+    "Loading all active CoinDCX USDT futures pairs";
 
   try {
     const [instrumentData, priceData] = await Promise.all([
@@ -642,7 +630,6 @@ async function runScan() {
       );
     });
 
-    // Har active pair consider hoga. Koi fixed coin-count limit nahi.
     const candidates = active.map(instrument => {
       const pair = typeof instrument === "string"
         ? instrument
@@ -652,7 +639,6 @@ async function runScan() {
         instrument,
         ticker: pair ? priceMap[pair] : null
       };
-
     }).filter(x =>
       x.instrument &&
       (
@@ -671,7 +657,7 @@ async function runScan() {
     scanStatus.eligiblePairs = withTicker.length;
 
     scanStatus.message =
-      `Scanning ${withTicker.length} active pairs; no fixed coin limit`;
+      `Deep scanning ${withTicker.length} active pairs`;
 
     const results = await mapAll(withTicker);
 
@@ -694,7 +680,6 @@ async function runScan() {
   }
 }
 
-// Main endpoint
 app.get("/", (req, res) => {
   res.json({
     name: "UD Liquidity Guard Scanner",
@@ -711,12 +696,10 @@ app.get("/", (req, res) => {
   });
 });
 
-// Scanner status
 app.get("/api/status", (req, res) => {
   res.json(scanStatus);
 });
 
-// BUY / SELL signals only
 app.get("/api/signals", (req, res) => {
   res.json({
     count: latestResults.length,
@@ -724,14 +707,12 @@ app.get("/api/signals", (req, res) => {
   });
 });
 
-// Rejection reasons
 app.get("/api/rejections", (req, res) => {
   res.json({
     rejected: rejectedCounts
   });
 });
 
-// Start manual full-market scan
 app.get("/api/scan", (req, res) => {
   if (scanStatus.running) {
     return res.json({
@@ -748,8 +729,6 @@ app.get("/api/scan", (req, res) => {
   });
 });
 
-// Manual coin search
-// Example: /api/search?pair=INSTRUMENT_PAIR
 app.get("/api/search", async (req, res) => {
   const pair = String(req.query.pair || "").trim();
 
@@ -790,7 +769,7 @@ app.get("/api/search", async (req, res) => {
       return res.json({
         pair,
         signal: "NO TRADE",
-        rejectionReasons: rejectedCounts
+        message: "Mandatory confirmations not passed"
       });
     }
 
@@ -803,7 +782,6 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-// Health check
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -811,7 +789,6 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(
     `UD Liquidity Guard running on port ${PORT}`
