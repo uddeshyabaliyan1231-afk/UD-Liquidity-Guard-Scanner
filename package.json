@@ -1,0 +1,13 @@
+
+{
+  "name": "ud-liquidity-guard-scanner",
+  "version": "1.0.0",
+  "description": "CoinDCX futures liquidity protection scanner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
