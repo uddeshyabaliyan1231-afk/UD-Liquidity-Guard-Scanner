@@ -1,4 +1,3 @@
-
 const express = require("express");
 
 const app = express();
@@ -7,71 +6,99 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const API = {
-  instruments:
-    "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT",
-  prices:
-    "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
-  candles:
-    "https://public.coindcx.com/market_data/candlesticks",
-  orderbook:
-    "https://public.coindcx.com/market_data/v3/orderbook"
+  instruments: "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT",
+  prices: "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
+  candles: "https://public.coindcx.com/market_data/candlesticks",
+  orderbook: "https://public.coindcx.com/market_data/v3/orderbook"
 };
 
 const CONFIG = {
   concurrency: 3,
-  requestDelay: 250,
+  requestSpacingMs: 350,
   minQuoteVolume: 100000,
   minBookDepth: 1500,
   maxSpreadPercent: 0.12,
   minImbalance: 1.15,
   maxWallConcentration: 0.45,
-  scanIntervalMs: 60000
+  scanIntervalMs: 60000,
+  requestTimeoutMs: 20000,
+  retries: 3
 };
 
 let latestResults = [];
 let rejectedCounts = {};
+
 let scanStatus = {
   running: false,
   lastScan: null,
   totalPairs: 0,
+  eligiblePairs: 0,
   checked: 0,
   signals: 0,
   skipped: 0,
   message: "Waiting for scan"
 };
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function getJSON(url, attempts = 3) {
+let requestTail = Promise.resolve();
+let lastRequestAt = 0;
+
+async function waitForRequestSlot() {
+  const previous = requestTail;
+  let release;
+
+  requestTail = new Promise(resolve => {
+    release = resolve;
+  });
+
+  await previous;
+
+  const wait = Math.max(
+    0,
+    CONFIG.requestSpacingMs - (Date.now() - lastRequestAt)
+  );
+
+  if (wait) await sleep(wait);
+
+  lastRequestAt = Date.now();
+  release();
+}
+
+async function getJSON(url, attempts = CONFIG.retries) {
   let lastError;
 
   for (let i = 0; i < attempts; i++) {
     try {
+      await waitForRequestSlot();
+
       const response = await fetch(url, {
-        headers: { "User-Agent": "UD-Liquidity-Guard-Scanner/1.0" },
-        signal: AbortSignal.timeout(20000)
+        headers: {
+          "User-Agent": "UD-Liquidity-Guard-Scanner/2.0"
+        },
+        signal: AbortSignal.timeout(CONFIG.requestTimeoutMs)
       });
 
-      if (response.status === 429 || response.status >= 500) {
-        throw new Error(`API status ${response.status}`);
-      }
-
       if (!response.ok) {
-        throw new Error(`API status ${response.status}`);
+        throw new Error(`CoinDCX API status ${response.status}`);
       }
 
       return await response.json();
+
     } catch (error) {
       lastError = error;
-      await sleep(1000 * (i + 1));
+
+      if (i < attempts - 1) {
+        await sleep(1000 * (i + 1));
+      }
     }
   }
 
   throw lastError;
 }
 
-function num(v) {
-  const n = Number(v);
+function num(value) {
+  const n = Number(value);
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -83,28 +110,43 @@ function getInstruments(data) {
 }
 
 function getPriceMap(data) {
-  if (Array.isArray(data)) {
+  const rows = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.prices)
+    ? data.prices
+    : Array.isArray(data?.data)
+    ? data.data
+    : null;
+
+  if (rows) {
     const map = {};
-    for (const item of data) {
-      const pair = item.pair || item.instrument;
+
+    for (const item of rows) {
+      const pair = item?.pair || item?.instrument;
       if (pair) map[pair] = item;
     }
+
     return map;
   }
 
-  return data?.prices || data?.data || data || {};
+  if (data && typeof data === "object") {
+    return data.prices || data.data || data;
+  }
+
+  return {};
 }
 
 function ema(values, period) {
   if (values.length < period) return null;
 
-  let result = values.slice(0, period)
-    .reduce((a, b) => a + b, 0) / period;
+  let result =
+    values.slice(0, period).reduce((a, b) => a + b, 0) / period;
 
   const multiplier = 2 / (period + 1);
 
   for (let i = period; i < values.length; i++) {
-    result = values[i] * multiplier +
+    result =
+      values[i] * multiplier +
       result * (1 - multiplier);
   }
 
@@ -119,42 +161,58 @@ function rsi(values, period = 14) {
 
   for (let i = values.length - period; i < values.length; i++) {
     const change = values[i] - values[i - 1];
+
     if (change > 0) gains += change;
     else losses += Math.abs(change);
   }
 
   if (losses === 0) return 100;
 
-  const rs = gains / Math.max(losses, 0.0000001);
+  const rs = gains / Math.max(losses, 1e-10);
+
   return 100 - 100 / (1 + rs);
 }
 
 function analyseCandles(candles) {
-  if (!Array.isArray(candles) || candles.length < 205) return null;
+  if (!Array.isArray(candles) || candles.length < 205) {
+    return null;
+  }
 
   const sorted = [...candles].sort(
     (a, b) => num(a.time) - num(b.time)
   );
 
-  // Ignore the currently forming candle.
+  // Current forming candle ko ignore karo.
   const closed = sorted.slice(0, -1);
+
   if (closed.length < 200) return null;
 
   const closes = closed.map(c => num(c.close));
   const volumes = closed.map(c => num(c.volume));
 
   const last = closed[closed.length - 1];
+
   const price = num(last.close);
   const open = num(last.open);
   const high = num(last.high);
   const low = num(last.low);
   const range = high - low;
 
-  if (!price || range <= 0) return null;
+  if (
+    !(price > 0) ||
+    !(range > 0) ||
+    closes.some(x => !(x > 0))
+  ) {
+    return null;
+  }
 
   const e20 = ema(closes, 20);
   const e50 = ema(closes, 50);
   const e200 = ema(closes, 200);
+
+  if (![e20, e50, e200].every(Number.isFinite)) {
+    return null;
+  }
 
   let trend = "SIDEWAYS";
 
@@ -178,8 +236,10 @@ function analyseCandles(candles) {
     trend,
     rsi: rsi(closes),
     volumeRising: recentVol > previousVol,
+
     upperWickRatio:
       (high - Math.max(open, price)) / range,
+
     lowerWickRatio:
       (Math.min(open, price) - low) / range
   };
@@ -198,6 +258,7 @@ async function getCandles(pair, resolution) {
   const from = now - minutes * 60 * 210;
 
   const url = new URL(API.candles);
+
   url.searchParams.set("pair", pair);
   url.searchParams.set("from", String(from));
   url.searchParams.set("to", String(now));
@@ -207,7 +268,8 @@ async function getCandles(pair, resolution) {
   const data = await getJSON(url.toString());
 
   if (Array.isArray(data)) return data;
-  return data?.data || [];
+
+  return Array.isArray(data?.data) ? data.data : [];
 }
 
 function parseSide(side) {
@@ -215,15 +277,21 @@ function parseSide(side) {
 
   if (Array.isArray(side)) {
     return side.map(x => ({
-      price: num(x.price ?? x[0]),
-      qty: num(x.quantity ?? x.qty ?? x[1])
+      price: num(x?.price ?? x?.[0]),
+      qty: num(x?.quantity ?? x?.qty ?? x?.[1])
     })).filter(x => x.price > 0 && x.qty > 0);
   }
 
-  return Object.entries(side).map(([price, qty]) => ({
-    price: num(price),
-    qty: num(qty)
-  })).filter(x => x.price > 0 && x.qty > 0);
+  if (typeof side === "object") {
+    return Object.entries(side)
+      .map(([price, qty]) => ({
+        price: num(price),
+        qty: num(qty)
+      }))
+      .filter(x => x.price > 0 && x.qty > 0);
+  }
+
+  return [];
 }
 
 async function checkOrderbook(pair) {
@@ -232,16 +300,19 @@ async function checkOrderbook(pair) {
 
   const data = await getJSON(url);
 
-  const bids = parseSide(data.bids).sort(
+  const bids = parseSide(data?.bids).sort(
     (a, b) => b.price - a.price
   );
 
-  const asks = parseSide(data.asks).sort(
+  const asks = parseSide(data?.asks).sort(
     (a, b) => a.price - b.price
   );
 
   if (!bids.length || !asks.length) {
-    return { safe: false, reason: "EMPTY_ORDERBOOK" };
+    return {
+      safe: false,
+      reason: "EMPTY_ORDERBOOK"
+    };
   }
 
   const bestBid = bids[0].price;
@@ -249,23 +320,28 @@ async function checkOrderbook(pair) {
   const mid = (bestBid + bestAsk) / 2;
 
   if (bestAsk <= bestBid || mid <= 0) {
-    return { safe: false, reason: "INVALID_BOOK" };
+    return {
+      safe: false,
+      reason: "INVALID_BOOK"
+    };
   }
 
   const spread = (bestAsk - bestBid) / mid * 100;
 
   const bidDepth = bids.reduce(
-    (s, x) => s + x.price * x.qty, 0
+    (sum, x) => sum + x.price * x.qty,
+    0
   );
 
   const askDepth = asks.reduce(
-    (s, x) => s + x.price * x.qty, 0
+    (sum, x) => sum + x.price * x.qty,
+    0
   );
 
   const totalDepth = bidDepth + askDepth;
 
   const imbalance =
-    bidDepth / Math.max(askDepth, 0.000001);
+    bidDepth / Math.max(askDepth, 1e-10);
 
   const largestWall = Math.max(
     ...bids.map(x => x.price * x.qty),
@@ -273,14 +349,18 @@ async function checkOrderbook(pair) {
   );
 
   const wallConcentration =
-    largestWall / Math.max(totalDepth, 0.000001);
+    largestWall / Math.max(totalDepth, 1e-10);
 
   const failures = [];
 
-  if (spread > CONFIG.maxSpreadPercent) failures.push("HIGH_SPREAD");
+  if (spread > CONFIG.maxSpreadPercent) {
+    failures.push("HIGH_SPREAD");
+  }
+
   if (Math.min(bidDepth, askDepth) < CONFIG.minBookDepth) {
     failures.push("LOW_DEPTH");
   }
+
   if (wallConcentration > CONFIG.maxWallConcentration) {
     failures.push("WALL_CONCENTRATION");
   }
@@ -297,8 +377,29 @@ async function checkOrderbook(pair) {
 }
 
 function reject(reason) {
-  rejectedCounts[reason] = (rejectedCounts[reason] || 0) + 1;
+  rejectedCounts[reason] =
+    (rejectedCounts[reason] || 0) + 1;
+
   return null;
+}
+
+function getTickerPrice(ticker) {
+  return num(
+    ticker?.ls ??
+    ticker?.last_price ??
+    ticker?.lastPrice ??
+    ticker?.price ??
+    ticker?.p
+  );
+}
+
+function getTickerVolume(ticker) {
+  return num(
+    ticker?.v ??
+    ticker?.volume ??
+    ticker?.volume_24h ??
+    ticker?.volume24h
+  );
 }
 
 async function scanCoin(item) {
@@ -307,14 +408,19 @@ async function scanCoin(item) {
 
   const pair = typeof instrument === "string"
     ? instrument
-    : instrument.pair;
+    : instrument?.pair;
 
-  if (!pair || !ticker) return reject("MISSING_TICKER");
+  if (!pair || !ticker) {
+    return reject("MISSING_TICKER");
+  }
 
-  const price = num(ticker.ls ?? ticker.last_price ?? ticker.price);
-  const volume = num(ticker.v ?? ticker.volume);
+  const price = getTickerPrice(ticker);
+  const volume = getTickerVolume(ticker);
 
-  if (!price) return reject("INVALID_PRICE");
+  if (!(price > 0)) {
+    return reject("INVALID_PRICE");
+  }
+
   if (volume * price < CONFIG.minQuoteVolume) {
     return reject("LOW_24H_VOLUME");
   }
@@ -327,29 +433,45 @@ async function scanCoin(item) {
     candleSets = await Promise.all(
       resolutions.map(r => getCandles(pair, r))
     );
-  } catch {
-    return reject("CANDLE_API_ERROR");
+  } catch (error) {
+    return reject(
+      error.message.includes("429")
+        ? "COINDCX_RATE_LIMIT"
+        : "CANDLE_API_ERROR"
+    );
   }
 
-  const a = candleSets.map(analyseCandles);
+  const analyses = candleSets.map(analyseCandles);
 
-  if (a.some(x => !x)) return reject("INSUFFICIENT_CANDLES");
+  if (analyses.some(x => !x)) {
+    return reject("INSUFFICIENT_CANDLES");
+  }
 
-  const [h4, h1, m30, m15, m5] = a;
+  const [h4, h1, m30, m15, m5] = analyses;
 
   let direction;
 
-  if ([h4, h1, m30].every(x => x.trend === "BULLISH")) {
+  if (
+    [h4, h1, m30].every(x => x.trend === "BULLISH")
+  ) {
     direction = "BUY";
-  } else if ([h4, h1, m30].every(x => x.trend === "BEARISH")) {
+
+  } else if (
+    [h4, h1, m30].every(x => x.trend === "BEARISH")
+  ) {
     direction = "SELL";
+
   } else {
     return reject("HIGHER_TF_CONFLICT");
   }
 
-  const expected = direction === "BUY" ? "BULLISH" : "BEARISH";
+  const expected =
+    direction === "BUY" ? "BULLISH" : "BEARISH";
 
-  if (m15.trend !== expected || m5.trend !== expected) {
+  if (
+    m15.trend !== expected ||
+    m5.trend !== expected
+  ) {
     return reject("LOWER_TF_CONFLICT");
   }
 
@@ -361,26 +483,51 @@ async function scanCoin(item) {
 
   try {
     book = await checkOrderbook(pair);
-  } catch {
-    return reject("ORDERBOOK_API_ERROR");
+  } catch (error) {
+    return reject(
+      error.message.includes("429")
+        ? "COINDCX_RATE_LIMIT"
+        : "ORDERBOOK_API_ERROR"
+    );
   }
 
-  if (!book.safe) return reject(book.reason || "LIQUIDITY_FAILED");
+  if (!book.safe) {
+    return reject(book.reason || "LIQUIDITY_FAILED");
+  }
 
   if (direction === "BUY") {
-    if (m5.rsi < 50 || m5.rsi > 72) return reject("BUY_RSI_FILTER");
-    if (m5.upperWickRatio > 0.45) return reject("BUY_REJECTION_WICK");
+    if (m5.rsi < 50 || m5.rsi > 72) {
+      return reject("BUY_RSI_FILTER");
+    }
+
+    if (m5.upperWickRatio > 0.45) {
+      return reject("BUY_REJECTION_WICK");
+    }
+
     if (book.imbalance < CONFIG.minImbalance) {
       return reject("BUY_ORDERBOOK_IMBALANCE");
     }
-    if (m5.price <= m5.open) return reject("BUY_CANDLE_CONFIRMATION");
+
+    if (m5.price <= m5.open) {
+      return reject("BUY_CANDLE_CONFIRMATION");
+    }
+
   } else {
-    if (m5.rsi < 28 || m5.rsi > 50) return reject("SELL_RSI_FILTER");
-    if (m5.lowerWickRatio > 0.45) return reject("SELL_REJECTION_WICK");
+    if (m5.rsi < 28 || m5.rsi > 50) {
+      return reject("SELL_RSI_FILTER");
+    }
+
+    if (m5.lowerWickRatio > 0.45) {
+      return reject("SELL_REJECTION_WICK");
+    }
+
     if (book.imbalance > 1 / CONFIG.minImbalance) {
       return reject("SELL_ORDERBOOK_IMBALANCE");
     }
-    if (m5.price >= m5.open) return reject("SELL_CANDLE_CONFIRMATION");
+
+    if (m5.price >= m5.open) {
+      return reject("SELL_CANDLE_CONFIRMATION");
+    }
   }
 
   const atrProxy = Math.max(
@@ -395,16 +542,21 @@ async function scanCoin(item) {
     pair,
     signal: direction,
     entry,
+
     stopLoss: direction === "BUY"
       ? entry - atrProxy * 1.5
       : entry + atrProxy * 1.5,
+
     target1: direction === "BUY"
       ? entry + atrProxy * 1.5
       : entry - atrProxy * 1.5,
+
     target2: direction === "BUY"
       ? entry + atrProxy * 2.5
       : entry - atrProxy * 2.5,
+
     timeframe: "5M",
+
     liquidity: {
       status: "PASSED",
       spreadPercent: Number(book.spread.toFixed(4)),
@@ -413,6 +565,7 @@ async function scanCoin(item) {
       imbalance: Number(book.imbalance.toFixed(3)),
       wallConcentration: Number(book.wallConcentration.toFixed(3))
     },
+
     trend: {
       "4H": h4.trend,
       "1H": h1.trend,
@@ -420,6 +573,7 @@ async function scanCoin(item) {
       "15M": m15.trend,
       "5M": m5.trend
     },
+
     scannedAt: new Date().toISOString()
   };
 }
@@ -431,6 +585,7 @@ async function mapAll(items) {
   async function worker() {
     while (true) {
       const index = next++;
+
       if (index >= items.length) return;
 
       try {
@@ -440,16 +595,18 @@ async function mapAll(items) {
       }
 
       scanStatus.checked++;
-      await sleep(CONFIG.requestDelay);
     }
   }
 
   const workers = Array.from(
-    { length: Math.min(CONFIG.concurrency, items.length) },
+    {
+      length: Math.min(CONFIG.concurrency, items.length)
+    },
     () => worker()
   );
 
   await Promise.all(workers);
+
   return results;
 }
 
@@ -460,8 +617,12 @@ async function runScan() {
   scanStatus.checked = 0;
   scanStatus.signals = 0;
   scanStatus.skipped = 0;
+  scanStatus.eligiblePairs = 0;
+
   rejectedCounts = {};
-  scanStatus.message = "Loading all active CoinDCX futures pairs";
+
+  scanStatus.message =
+    "Loading active CoinDCX USDT futures pairs";
 
   try {
     const [instrumentData, priceData] = await Promise.all([
@@ -474,45 +635,66 @@ async function runScan() {
 
     const active = instruments.filter(item => {
       if (typeof item === "string") return true;
-      return !item.status || String(item.status).toLowerCase() === "active";
+
+      return (
+        !item?.status ||
+        String(item.status).toLowerCase() === "active"
+      );
     });
 
-    // NO COIN LIMIT: every active pair returned by CoinDCX is included.
+    // Har active pair consider hoga. Koi fixed coin-count limit nahi.
     const candidates = active.map(instrument => {
       const pair = typeof instrument === "string"
         ? instrument
-        : instrument.pair;
+        : instrument?.pair;
 
       return {
         instrument,
-        ticker: priceMap[pair]
+        ticker: pair ? priceMap[pair] : null
       };
-    });
+
+    }).filter(x =>
+      x.instrument &&
+      (
+        typeof x.instrument === "string" ||
+        x.instrument.pair
+      )
+    );
 
     scanStatus.totalPairs = candidates.length;
-    scanStatus.skipped = candidates.filter(x => !x.ticker).length;
+
+    scanStatus.skipped =
+      candidates.filter(x => !x.ticker).length;
 
     const withTicker = candidates.filter(x => x.ticker);
 
+    scanStatus.eligiblePairs = withTicker.length;
+
     scanStatus.message =
-      `Scanning all ${withTicker.length} active pairs; no shortlist limit`;
+      `Scanning ${withTicker.length} active pairs; no fixed coin limit`;
 
     const results = await mapAll(withTicker);
 
     latestResults = results.filter(
-      x => x && (x.signal === "BUY" || x.signal === "SELL")
+      x => x && (
+        x.signal === "BUY" ||
+        x.signal === "SELL"
+      )
     );
 
     scanStatus.signals = latestResults.length;
     scanStatus.lastScan = new Date().toISOString();
     scanStatus.message = "Full market scan completed";
+
   } catch (error) {
     scanStatus.message = `Scan error: ${error.message}`;
+
   } finally {
     scanStatus.running = false;
   }
 }
 
+// Main endpoint
 app.get("/", (req, res) => {
   res.json({
     name: "UD Liquidity Guard Scanner",
@@ -522,15 +704,19 @@ app.get("/", (req, res) => {
       "/api/status",
       "/api/signals",
       "/api/rejections",
-      "/api/scan"
+      "/api/scan",
+      "/api/search?pair=BTCUSDT",
+      "/api/health"
     ]
   });
 });
 
+// Scanner status
 app.get("/api/status", (req, res) => {
   res.json(scanStatus);
 });
 
+// BUY / SELL signals only
 app.get("/api/signals", (req, res) => {
   res.json({
     count: latestResults.length,
@@ -538,12 +724,14 @@ app.get("/api/signals", (req, res) => {
   });
 });
 
+// Rejection reasons
 app.get("/api/rejections", (req, res) => {
   res.json({
     rejected: rejectedCounts
   });
 });
 
+// Start manual full-market scan
 app.get("/api/scan", (req, res) => {
   if (scanStatus.running) {
     return res.json({
@@ -560,12 +748,79 @@ app.get("/api/scan", (req, res) => {
   });
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+// Manual coin search
+// Example: /api/search?pair=INSTRUMENT_PAIR
+app.get("/api/search", async (req, res) => {
+  const pair = String(req.query.pair || "").trim();
+
+  if (!pair) {
+    return res.status(400).json({
+      error: "pair query is required"
+    });
+  }
+
+  try {
+    const [instrumentData, priceData] = await Promise.all([
+      getJSON(API.instruments),
+      getJSON(API.prices)
+    ]);
+
+    const instruments = getInstruments(instrumentData);
+    const priceMap = getPriceMap(priceData);
+
+    const instrument = instruments.find(x =>
+      (typeof x === "string" ? x : x?.pair) === pair
+    );
+
+    const ticker = priceMap[pair];
+
+    if (!instrument || !ticker) {
+      return res.status(404).json({
+        error: "Active CoinDCX pair or ticker not found",
+        pair
+      });
+    }
+
+    const result = await scanCoin({
+      instrument,
+      ticker
+    });
+
+    if (!result) {
+      return res.json({
+        pair,
+        signal: "NO TRADE",
+        rejectionReasons: rejectedCounts
+      });
+    }
+
+    return res.json(result);
+
+  } catch (error) {
+    return res.status(502).json({
+      error: error.message
+    });
+  }
 });
 
+// Health check
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    time: new Date().toISOString()
+  });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`UD Liquidity Guard running on port ${PORT}`);
+  console.log(
+    `UD Liquidity Guard running on port ${PORT}`
+  );
+
   runScan();
-  setInterval(runScan, CONFIG.scanIntervalMs);
+
+  setInterval(
+    runScan,
+    CONFIG.scanIntervalMs
+  );
 });
